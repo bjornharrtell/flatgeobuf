@@ -1,10 +1,9 @@
 package org.wololo.flatgeobuf.geotools;
 
 import java.io.IOException;
+import java.nio.DoubleBuffer;
 import java.util.stream.Stream;
 import java.util.Arrays;
-import java.util.function.IntFunction;
-import java.util.function.Supplier;
 import java.util.stream.DoubleStream;
 
 import com.google.flatbuffers.FlatBufferBuilder;
@@ -16,15 +15,16 @@ import org.locationtech.jts.geom.LineString;
 import org.locationtech.jts.geom.LinearRing;
 import org.locationtech.jts.geom.MultiLineString;
 import org.locationtech.jts.geom.MultiPolygon;
-import org.locationtech.jts.geom.Coordinate;
+import org.locationtech.jts.geom.CoordinateSequence;
 import org.locationtech.jts.geom.GeometryFactory;
+import org.locationtech.jts.geom.impl.PackedCoordinateSequence;
 
 import org.wololo.flatgeobuf.generated.*;
 import org.wololo.flatgeobuf.generated.Geometry;
 
 public class GeometryConversions {
     public static GeometryOffsets serialize(FlatBufferBuilder builder, org.locationtech.jts.geom.Geometry geometry,
-    		byte geometryType) throws IOException {
+            byte geometryType, HeaderMeta headerMeta) throws IOException {
         GeometryOffsets go = new GeometryOffsets();
 
         if (geometryType == GeometryType.MultiLineString) {
@@ -43,102 +43,120 @@ public class GeometryConversions {
             for (int i = 0; i < p.getNumInteriorRing(); i++)
                 go.ends[i + 1] = end += p.getInteriorRingN(i).getNumPoints();
         } else if (geometryType == GeometryType.MultiPolygon) {
-        	MultiPolygon mp = (MultiPolygon) geometry;
-        	int numGeometries = mp.getNumGeometries();
-        	GeometryOffsets[] gos = new GeometryOffsets[numGeometries];
-        	for (int i = 0; i < numGeometries; i++) {
+            MultiPolygon mp = (MultiPolygon) geometry;
+            int numGeometries = mp.getNumGeometries();
+            GeometryOffsets[] gos = new GeometryOffsets[numGeometries];
+            for (int i = 0; i < numGeometries; i++) {
                 Polygon p = (Polygon) mp.getGeometryN(i);
-                gos[i] = serialize(builder, p, GeometryType.Polygon);
+                gos[i] = serialize(builder, p, GeometryType.Polygon, headerMeta);
             }
-        	go.gos = gos;
-        	return go;
+            go.gos = gos;
+            return go;
         }
-        
-        Stream<Coordinate> cs = Stream.of(geometry.getCoordinates());
-        double[] coords;
-        //if (headerMeta.hasZ && headerMeta.hasM)
-        //    coords = cs.flatMapToDouble(c -> DoubleStream.of(c.x, c.y, c.getZ(), c.getM())).toArray();
-        //else if (headerMeta.hasZ || headerMeta.hasM)
-        //    coords = cs.flatMapToDouble(c -> DoubleStream.of(c.x, c.y, c.getZ())).toArray();
-        //else
-            coords = cs.flatMapToDouble(c -> DoubleStream.of(c.x, c.y)).toArray();
-        go.coordsOffset = Geometry.createXyVector(builder, coords);
-        
+
+        go.xyOffset = Geometry.createXyVector(builder, Stream.of(geometry.getCoordinates()).flatMapToDouble(c -> DoubleStream.of(c.x, c.y)).toArray());
+        if (headerMeta.hasZ)
+            go.zOffset = Geometry.createZVector(builder, Stream.of(geometry.getCoordinates()).mapToDouble(c -> c.getZ()).toArray());
+        if (headerMeta.hasM)
+            go.mOffset = Geometry.createMVector(builder, Stream.of(geometry.getCoordinates()).mapToDouble(c -> c.getM()).toArray());
+
         if (go.ends != null)
             go.endsOffset = Geometry.createEndsVector(builder, go.ends);
 
         return go;
     }
 
-    public static org.locationtech.jts.geom.Geometry deserialize(Geometry geometry, byte geometryType) {
+    private static Polygon makePolygonWithRings(GeometryFactory factory, Geometry geometry, double[] cs, int size, int dim, int measures, int endsLength) {
+        LinearRing[] lrs = new LinearRing[endsLength];
+        int s = 0;
+        for (int i = 0; i < endsLength; i++) {
+            int e = (int) geometry.ends(i);
+            CoordinateSequence partialCoordinateSequence = new PackedCoordinateSequence.Double(
+                    Arrays.copyOfRange(cs, s * size, e * size),
+                    dim, measures);
+            lrs[i] = factory.createLinearRing(partialCoordinateSequence);
+            s = e;
+        }
+        LinearRing shell = lrs[0];
+        LinearRing holes[] = Arrays.copyOfRange(lrs, 1, endsLength);
+        return factory.createPolygon(shell, holes);
+    }
+
+    private static Polygon makePolygon(GeometryFactory factory, Geometry geometry, CoordinateSequence coordinateSequence, double[] cs, int size, int dim, int measures) {
+        int endsLength = geometry.endsLength();
+        if (endsLength > 1)
+            return makePolygonWithRings(factory, geometry, cs, size, dim, measures, endsLength);
+        else
+            return factory.createPolygon(coordinateSequence);
+    }
+
+    public static org.locationtech.jts.geom.Geometry deserialize(Geometry geometry, byte geometryType, HeaderMeta headerMeta) {
         GeometryFactory factory = new GeometryFactory();
         
         switch (geometryType) {
-    	case GeometryType.MultiPolygon:
-    		int partsLength = geometry.partsLength();
-    		Polygon[] polygons = new Polygon[partsLength];
-    		for (int i = 0; i < geometry.partsLength(); i++) {
-    			polygons[i] = (Polygon) deserialize(geometry.parts(i), GeometryType.Polygon);
-    		}
-    		return factory.createMultiPolygon(polygons);
-    	}
+        case GeometryType.MultiPolygon:
+            int partsLength = geometry.partsLength();
+            Polygon[] polygons = new Polygon[partsLength];
+            for (int i = 0; i < geometry.partsLength(); i++)
+                polygons[i] = (Polygon) deserialize(geometry.parts(i), GeometryType.Polygon, headerMeta);
+            return factory.createMultiPolygon(polygons);
+        }
         
-        
-        int xyLength = geometry.xyLength();
-        Coordinate[] coordinates = new Coordinate[xyLength >> 1];
-        int c = 0;
-        for (int i = 0; i < xyLength; i = i + 2)
-            coordinates[c++] = new Coordinate(geometry.xy(i), geometry.xy(i + 1));
-
-        IntFunction<Polygon> makePolygonWithRings = (int endsLength) -> {
-            LinearRing[] lrs = new LinearRing[endsLength];
-            int s = 0;
-            for (int i = 0; i < endsLength; i++) {
-                int e = (int) geometry.ends(i);
-                Coordinate[] cs = Arrays.copyOfRange(coordinates, s, e);
-                lrs[i] = factory.createLinearRing(cs);
-                s = e;
+        int dim = 2;
+        if (headerMeta.hasZ)
+            dim++;
+        int measures = 0;
+        if (headerMeta.hasM)
+            measures++;
+        int coordinateSize = dim + measures; // number of doubles per coordinate
+        double[] coordinateDoubleArray = null;
+        if (dim > 2) {
+            // TODO: does not handle measure only
+            // NOTE: inefficient, need PackedCoordinateSequence variant with similar memory model
+            coordinateDoubleArray = new double[(geometry.xyLength() / 2) * coordinateSize];
+            for (int i = 0; i < coordinateDoubleArray.length; i += coordinateSize) {
+                coordinateDoubleArray[i] = geometry.xy((i / coordinateSize) * 2);
+                coordinateDoubleArray[i + 1] = geometry.xy((i / coordinateSize) * 2 + 1);
+                if (headerMeta.hasZ)
+                    coordinateDoubleArray[i + 2] = geometry.z((i / coordinateSize));
+                if (headerMeta.hasM)
+                    coordinateDoubleArray[i + 3] = geometry.m((i / coordinateSize));
             }
-            LinearRing shell = lrs[0];
-            LinearRing holes[] = Arrays.copyOfRange(lrs, 1, endsLength);
-            return factory.createPolygon(shell, holes);
-        };
-
-        Supplier<Polygon> makePolygon = () -> {
-            int endsLength = geometry.endsLength();
-            if (endsLength > 1)
-                return makePolygonWithRings.apply(endsLength);
-            else
-                return factory.createPolygon(coordinates);
-        };
+        } else {
+            DoubleBuffer coordinateDoubleBuffer = geometry.xyAsByteBuffer().asDoubleBuffer();
+            coordinateDoubleArray = new double[coordinateDoubleBuffer.remaining()];
+            coordinateDoubleBuffer.get(coordinateDoubleArray);
+        }
+        CoordinateSequence coordinateSequence = new PackedCoordinateSequence.Double(coordinateDoubleArray, dim, measures);
 
         switch (geometryType) {
         case GeometryType.Point:
-            if (coordinates.length > 0) {
-                return factory.createPoint(coordinates[0]);
-            } else {
+            if (coordinateSequence.size() > 0)
+                return factory.createPoint(coordinateSequence.getCoordinate(0));
+            else
                 return factory.createPoint();
-            }
         case GeometryType.MultiPoint:
-            return factory.createMultiPointFromCoords(coordinates);
+            return factory.createMultiPoint(coordinateSequence);
         case GeometryType.LineString:
-            return factory.createLineString(coordinates);
+            return factory.createLineString(coordinateSequence);
         case GeometryType.MultiLineString: {
             int lengthLengths = geometry.endsLength();
             if (lengthLengths < 2)
-                return factory.createMultiLineString(new LineString[] { factory.createLineString(coordinates) });
+                return factory.createMultiLineString(new LineString[] { factory.createLineString(coordinateSequence) });
             LineString[] lss = new LineString[lengthLengths];
             int s = 0;
             for (int i = 0; i < lengthLengths; i++) {
                 int e = (int) geometry.ends(i);
-                Coordinate[] cs = Arrays.copyOfRange(coordinates, s, e);
-                lss[i] = factory.createLineString(cs);
+                CoordinateSequence partialCoordinateSequence = new PackedCoordinateSequence.Double(
+                        Arrays.copyOfRange(coordinateDoubleArray, s * coordinateSize, e * coordinateSize),
+                        dim, measures);
+                lss[i] = factory.createLineString(partialCoordinateSequence);
                 s = e;
             }
             return factory.createMultiLineString(lss);
         }
         case GeometryType.Polygon:
-            return makePolygon.get();
+            return makePolygon(factory, geometry, coordinateSequence, coordinateDoubleArray, coordinateSize, dim, measures);
         default:
             throw new RuntimeException("Unknown geometry type");
         }
